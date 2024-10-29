@@ -21,8 +21,12 @@ x_test = x_test.astype('float32') / 255
 """
 show a simple example usage of VeriX. 
 """
+np.random.seed(42)
+indices = np.random.choice(x_test.shape[0], 5)
+idx = indices[0]
 verix = VeriX(dataset="MNIST",
-              image=x_test[10],
+              name=idx,
+              image=x_test[idx],
               model_path="models/mnist-10x2.onnx")
 verix.traversal_order(traverse="heuristic")
 verix.get_explanation(epsilon=0.05)
@@ -52,7 +56,3 @@ print("Test loss:", score[0])
 print("Test accuracy:", score[1])
 # model.save('models/' + model_name + '.h5')
 model_proto, _ = tf2onnx.convert.from_keras(model, output_path='models/' + model_name + '.onnx')
-
-
-
-

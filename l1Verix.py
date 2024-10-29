@@ -50,6 +50,7 @@ class VeriX:
         :param model_path: the path to the neural network.
         :param plot_original: if True, then plot the original image.
         """
+        print(image)
         self.dataset = dataset
         self.name = name
         self.image = image
@@ -147,7 +148,6 @@ class VeriX:
 
         l1_vars = []
         for pixel in self.inputVars:
-            print(len(sat_set) + len(unsat_set))
             for i in self.inputVars:
                 """
                 Set constraints on the input variables.
@@ -171,7 +171,7 @@ class VeriX:
                         # diff_variable = perturbed_pixel - fixed_pixel
                         e2 = MarabouUtils.Equation()
                         diff_variable = self.mara_model.getNewVariable()
-                        e2.addAddend(1, self.inputVars[i])
+                        e2.addAddend(1, self.mara_model.inputVars[0][i])
                         e2.addAddend(-1, image_variable)
                         e2.addAddend(-1, diff_variable)
                         e2.setScalar(0)
@@ -274,7 +274,7 @@ class VeriX:
                                         saturation=1),
                         path="timeout-%d.png" % len(timeout_set))
             
-        # assert self.fast_test_explanation(image, epsilon, sat_set, unsat_set)
+        assert self.fast_test_explanation(image, epsilon, sat_set, unsat_set)
         return len(sat_set), len(timeout_set)
     
     def fast_test_explanation(self, image, epsilon, sat_set, unsat_set, counterfactual):
@@ -322,7 +322,7 @@ class VeriX:
             if exit_code == 'sat':
                 return False
         # make sure that the norm difference from the original image is less than epsilon
-        if np.linalg.norm(image.flatten() - counterfactual.flatten(), ord=1) > epsilon:
+        if np.linalg.norm(image.flatten() - counterfactual.flatten(), np.inf) > epsilon:
             return False
         # make sure that different pixels from the original are entirely in the unsat set
         # except for one in the sat_set

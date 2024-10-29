@@ -1,19 +1,13 @@
 import random
+import torch
 import numpy as np
 import onnx
 import onnxruntime as ort
 from skimage.color import label2rgb
 from matplotlib import pyplot as plt
-import os
-
-# import sys
-# sys.path.insert(0, "Marabou")
-"""
-After installing Marabou, load it from maraboupy.
-"""
 from maraboupy import Marabou
-from maraboupy import MarabouUtils
-
+import collections
+import os
 
 class VeriX:
     """
@@ -38,8 +32,8 @@ class VeriX:
                                     solveWithMILP=True)
 
     def __init__(self,
-                 dataset,
                  name,
+                 dataset,
                  image,
                  model_path,
                  plot_original=True):
@@ -51,8 +45,8 @@ class VeriX:
         :param plot_original: if True, then plot the original image.
         """
         self.dataset = dataset
-        self.name = name
         self.image = image
+        self.name = name
         """
         Load the onnx model.
         """
@@ -102,20 +96,28 @@ class VeriX:
                 Different ways to compute sensitivity: use pixel reversal for MNIST and deletion for GTSRB.
                 """
                 if self.dataset == "MNIST":
+                    # TODO: also try different ablation methods.
                     image_batch_manip[i][i][:] = 1 - image_batch_manip[i][i][:]
                 elif self.dataset == "GTSRB":
                     image_batch_manip[i][i][:] = 0
                 else:
                     print("Dataset not supported: try 'MNIST' or 'GTSRB'.")
+
             image_batch = image_batch.reshape((width * height, width, height, channel))
             predictions = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: image_batch})
             predictions = np.asarray(predictions[0])
+
             image_batch_manip = image_batch_manip.reshape((width * height, width, height, channel))
             predictions_manip = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: image_batch_manip})
             predictions_manip = np.asarray(predictions_manip[0])
-            difference = predictions - predictions_manip
-            features = difference[:, self.label]
-            sorted_index = features.argsort()
+
+            # difference = predictions - predictions_manip
+            # features = difference[:, self.label]
+            kl_difference = np.sum(predictions * np.log(np.maximum(predictions, 1e-9) / (np.maximum(predictions_manip, 1e-9))), axis=-1)
+            features = kl_difference
+
+            sorted_index = features.argsort() # TOOD: understand why this happens lmfao [::-1]
+
             self.inputVars = sorted_index
             self.sensitivity = features.reshape(width, height)
             if plot_sensitivity:
@@ -139,15 +141,34 @@ class VeriX:
         :param plot_timeout: if True, plot the timeout pixel(s).
         :return: an explanation, and possible counterfactual(s).
         """
-        unsat_set = []
-        sat_set = []
-        timeout_set = []
+
+        '''
+        u -> v iff u in A and v in {u}+B and v was in u's counterfactual
+        note that it is impossible for there to be paths of length > 1
+        '''
+        c_G = [[] for _ in range(len(self.inputVars))]
+
+        '''
+        same_counterfactual has key of a counterfactual changed pixels in B  
+        and values of pixels in A who utilized the same B values as their counterfactual
+        '''
+        same_counterfactual = {}
+
+        unsat_set = set() # B
+        sat_set = set() # A
+        timeout_set = set()
         width, height, channel = self.image.shape[0], self.image.shape[1], self.image.shape[2]
         image = self.image.reshape(width * height, channel)
 
-        l1_vars = []
-        for pixel in self.inputVars:
-            print(len(sat_set) + len(unsat_set))
+        tmp = self.inputVars.copy()
+
+        dq = collections.deque(self.inputVars)
+
+        cnt_iter = 0
+        while len(dq) > 0:
+            pixel = dq.popleft()
+            cnt_iter += 1
+            # print(cnt_iter)
             for i in self.inputVars:
                 """
                 Set constraints on the input variables.
@@ -159,29 +180,6 @@ class VeriX:
                     if self.dataset == "MNIST":
                         self.mara_model.setLowerBound(i, max(0, image[i][:] - epsilon))
                         self.mara_model.setUpperBound(i, min(1, image[i][:] + epsilon))
-
-                        # make fixed variable for the image pixel
-                        e = MarabouUtils.Equation()
-                        image_variable = self.mara_model.getNewVariable()
-                        e.addAddend(1, image_variable)
-                        e.setScalar(image[i][:])
-                        self.mara_model.addEquation(e)
-
-                        # find the difference between the perturbed pixel and the fixed variable
-                        # diff_variable = perturbed_pixel - fixed_pixel
-                        e2 = MarabouUtils.Equation()
-                        diff_variable = self.mara_model.getNewVariable()
-                        e2.addAddend(1, self.inputVars[i])
-                        e2.addAddend(-1, image_variable)
-                        e2.addAddend(-1, diff_variable)
-                        e2.setScalar(0)
-                        self.mara_model.addEquation(e2)
-
-                        # get the absolute value of the difference
-                        abs_diff_variable = self.mara_model.getNewVariable()
-                        self.mara_model.addAbsConstraint(diff_variable, abs_diff_variable)
-
-                        l1_vars.append(abs_diff_variable)
                     elif self.dataset == "GTSRB":
                         self.mara_model.setLowerBound(3 * i, max(0, image[i][0] - epsilon))
                         self.mara_model.setUpperBound(3 * i, min(1, image[i][0] + epsilon))
@@ -207,10 +205,6 @@ class VeriX:
                         self.mara_model.setUpperBound(3 * i + 2, image[i][2])
                     else:
                         print("Dataset not supported: try 'MNIST' or 'GTSRB'.")
-
-            # l1 norm constraint
-            self.mara_model.addInequality(l1_vars, [1] * len(l1_vars), epsilon, isProperty=True)
-
             for j in range(len(self.outputVars)):
                 """
                 Set constraints on the output variables.
@@ -228,30 +222,60 @@ class VeriX:
                         break
                     elif exit_code == 'unsat':
                         continue
-            
-            """
-            clearProperty() is to clear both input and output constraints.
-            """
+            # clear input and output constraints.
             self.mara_model.clearProperty()
-            """
-            If unsat, put the pixel into the irrelevant set; 
-            if timeout, into the timeout set; 
-            if sat, into the explanation.
-            """
+
             if exit_code == 'unsat':
-                unsat_set.append(pixel)
+                unsat_set.add(pixel)
+                # print(pixel, "unsat")
             elif exit_code == 'TIMEOUT':
-                timeout_set.append(pixel)
+                timeout_set.add(pixel)
             elif exit_code == 'sat':
-                sat_set.append(pixel)
-                if plot_counterfactual:
+                sat_set.add(pixel)
+                if True or plot_counterfactual:
                     counterfactual = [vals.get(i) for i in self.mara_model.inputVars[0].flatten()]
                     counterfactual = np.asarray(counterfactual).reshape(self.image.shape)
+
+                    changed_mask = np.abs(counterfactual.reshape(image.shape) - self.image.reshape(image.shape)) > 1e-6
+                    c_G[pixel] = np.where(changed_mask)[0]
+
+                    counterfactual_key = tuple(c_G[pixel])
+                    same_counterfactual[counterfactual_key] = same_counterfactual.get(counterfactual_key, []) + [pixel]
+                    if (len(same_counterfactual[counterfactual_key]) > 10 and changed_mask.sum() >= 5) or (len(same_counterfactual[counterfactual_key]) > 50 and changed_mask.sum() >= 1):
+                        print("triggered")
+                        prediction = [vals.get(i) for i in self.outputVars]
+                        prediction = np.asarray(prediction).argmax()
+                        self.save_figure(image=counterfactual,
+                                    path="axed_counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
+                                    cmap="gray" if self.dataset == 'MNIST' else None)
+
+                        # Remove elements in A that relied on counterfactual
+                        for p in same_counterfactual[counterfactual_key]:
+                            sat_set.remove(p)
+                            dq.append(p)
+                        same_counterfactual[counterfactual_key] = []
+
+                        for p in c_G[pixel]:
+                            # Remove elements in B of the counterfactual
+                            unsat_set.remove(p)
+
+                            # Remove elements from A that relied on that particular element in B
+                            depends_on_p = {p2 for p2 in sat_set if p in c_G[p2]}
+                            for p2 in depends_on_p:
+                                dq.appendleft(p2)
+                            sat_set = sat_set - depends_on_p
+                        continue
+
                     prediction = [vals.get(i) for i in self.outputVars]
                     prediction = np.asarray(prediction).argmax()
-                    self.save_figure(image=counterfactual,
-                                path="counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
-                                cmap="gray" if self.dataset == 'MNIST' else None)
+                    # self.save_figure(image=counterfactual,
+                    #             path="counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
+                    #             cmap="gray" if self.dataset == 'MNIST' else None)
+                    
+        self.inputVars = tmp
+        sat_set = list(sat_set)
+        timeout_set = list(timeout_set)
+
         if plot_explanation:
             mask = np.zeros(self.inputVars.shape).astype(bool)
             mask[sat_set] = True
@@ -273,79 +297,10 @@ class VeriX:
                                         bg_label=0,
                                         saturation=1),
                         path="timeout-%d.png" % len(timeout_set))
-            
-        # assert self.fast_test_explanation(image, epsilon, sat_set, unsat_set)
+        # assert self.test_explanation(image, epsilon, sat_set, unsat_set)
+        # print("passed tests")
         return len(sat_set), len(timeout_set)
     
-    def fast_test_explanation(self, image, epsilon, sat_set, unsat_set, counterfactual):
-        # check if there is a counterfactual with only the unsat pixels
-        for i in self.inputVars:
-            if i in unsat_set:
-                if self.dataset == "MNIST":
-                        self.mara_model.setLowerBound(i, max(0, image[i][:] - epsilon))
-                        self.mara_model.setUpperBound(i, min(1, image[i][:] + epsilon))
-                elif self.dataset == "GTSRB":
-                    self.mara_model.setLowerBound(3 * i, max(0, image[i][0] - epsilon))
-                    self.mara_model.setUpperBound(3 * i, min(1, image[i][0] + epsilon))
-                    self.mara_model.setLowerBound(3 * i + 1, max(0, image[i][1] - epsilon))
-                    self.mara_model.setUpperBound(3 * i + 1, min(1, image[i][1] + epsilon))
-                    self.mara_model.setLowerBound(3 * i + 2, max(0, image[i][2] - epsilon))
-                    self.mara_model.setUpperBound(3 * i + 2, min(1, image[i][2] + epsilon))
-                else:
-                    print("Dataset not supported: try 'MNIST' or 'GTSRB'.")
-            else:
-                if self.dataset == "MNIST":
-                    self.mara_model.setLowerBound(i, image[i][:])
-                    self.mara_model.setUpperBound(i, image[i][:])
-                elif self.dataset == "GTSRB":
-                    self.mara_model.setLowerBound(3 * i, image[i][0])
-                    self.mara_model.setUpperBound(3 * i, image[i][0])
-                    self.mara_model.setLowerBound(3 * i + 1, image[i][1])
-                    self.mara_model.setUpperBound(3 * i + 1, image[i][1])
-                    self.mara_model.setLowerBound(3 * i + 2, image[i][2])
-                    self.mara_model.setUpperBound(3 * i + 2, image[i][2])
-                else:
-                    print("Dataset not supported: try 'MNIST' or 'GTSRB'.")
-            for j in range(len(self.outputVars)):
-                if j != self.label:
-                    self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
-                                                  [1, -1], -1e-6,
-                                                  isProperty=True)
-                    exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
-                    self.mara_model.additionalEquList.clear() 
-                    if exit_code == 'sat' or exit_code == 'TIMEOUT':
-                        break
-                    elif exit_code == 'unsat':
-                        continue
-            self.mara_model.clearProperty()
-            assert exit_code != 'TIMEOUT'
-            if exit_code == 'sat':
-                return False
-        # make sure that the norm difference from the original image is less than epsilon
-        if np.linalg.norm(image.flatten() - counterfactual.flatten(), ord=1) > epsilon:
-            return False
-        # make sure that different pixels from the original are entirely in the unsat set
-        # except for one in the sat_set
-        cnt_in_sat_set = 0
-        cnt_in_unsat_set = 0
-        for i in self.inputVars:
-            if image[i] != counterfactual[i]:
-                if i in unsat_set:
-                    cnt_in_unsat_set += 1
-                elif i in sat_set:
-                    cnt_in_sat_set += 1
-                else:
-                    return False
-        if cnt_in_sat_set > 1:
-            return False
-        # check if the counterfactual is a valid counterfactual by running the model
-        counterfactual_result = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: np.expand_dims(counterfactual, axis=0)})
-        counterfactual_result = np.asarray(counterfactual_result[0])
-        if counterfactual_result.argmax() == self.label:
-            return False
-        return True
-
-            
 
     def test_explanation(self, image, epsilon, sat_set, unsat_set):
         for pixel in sat_set + [-1]: # pixel=-1 represents testing unsat pixels only
@@ -397,7 +352,6 @@ class VeriX:
         return True
 
     def save_figure(self, image, path, cmap=None):
-        return
         """
         To plot figures.
         :param image: the image array of shape (width, height, channel)
@@ -405,7 +359,7 @@ class VeriX:
         :param cmap: 'gray' if to plot gray scale image.
         :return: an image saved to the designated path.
         """
-        folder = f"outputs/{self.name}/"
+        folder = f"myoutputs/{self.name}/"
         if not os.path.exists(folder):
             os.makedirs(folder)
         path = folder + path
@@ -420,3 +374,23 @@ class VeriX:
             plt.imshow(image, cmap=cmap)
         plt.savefig(path, bbox_inches='tight')
         plt.close(fig)
+
+
+'''
+for k in cnt_same_dep:
+    # if key_cnt and k are 80% similar, remove k
+    set_key = set(key_cnt)
+    set_k = set(k)
+    set_diff = set_k.difference(set_key)
+    if len(set_diff) <= 0.2 * len(set_key):
+        for p in cnt_same_dep[k]:
+            sat_set.remove(p)
+        self.inputVars = np.append(self.inputVars, np.array(cnt_same_dep[k]))
+        cnt_same_dep[k] = []
+        for p in k:
+            unsat_set.remove(p)
+        self.inputVars = np.append(self.inputVars, np.array(k))
+
+continue
+
+'''
