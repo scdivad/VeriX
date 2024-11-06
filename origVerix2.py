@@ -238,7 +238,6 @@ class VeriX:
                     # get max difference between counterfactual and original
                     max_diff = np.max(np.abs(image.flatten() - counterfactuals[pixel].flatten()))
                     print(f"{self.name} max_diff: ", max_diff)
-                    exit()
 
                     prediction = [vals.get(i) for i in self.outputVars]
                     prediction = np.asarray(prediction).argmax()

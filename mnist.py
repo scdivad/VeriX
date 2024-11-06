@@ -5,7 +5,9 @@ from keras.datasets import mnist
 from keras.losses import CategoricalCrossentropy
 from keras.optimizers import Adam
 import tf2onnx
-from VeriX import *
+from myVeriX2 import *
+import time
+import sys
 
 """
 download and process MNIST data.
@@ -22,14 +24,25 @@ x_test = x_test.astype('float32') / 255
 show a simple example usage of VeriX. 
 """
 np.random.seed(42)
-indices = np.random.choice(x_test.shape[0], 5)
-idx = indices[0]
-verix = VeriX(dataset="MNIST",
-              name=idx,
-              image=x_test[idx],
-              model_path="models/mnist-10x2.onnx")
-verix.traversal_order(traverse="heuristic")
-verix.get_explanation(epsilon=0.05)
+indices = np.random.choice(x_test.shape[0], 1000)
+print(indices)
+
+tot_sat_len = 0
+tot_timeout_len = 0
+for idx in indices:
+    time_start = time.time()
+    verix = VeriX(dataset="MNIST",
+                  name=idx,
+                image=x_test[idx],
+                model_path="models/mnist-10x2.onnx")
+    verix.traversal_order(traverse="heuristic")
+    len_sat_set, len_timeout_set = verix.get_explanation(epsilon=0.05)
+    time_end = time.time()
+    tot_sat_len += len_sat_set
+    tot_timeout_len += len_timeout_set
+    print(f"{idx} {time_end - time_start} {len_sat_set}", file=sys.stdout, flush=True)
+
+print("all: ", tot_sat_len, tot_timeout_len)
 exit()
 
 """
