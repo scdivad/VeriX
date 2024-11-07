@@ -29,20 +29,23 @@ class VeriX:
     inputVars = None
     outputVars = None
     epsilon: float
+    threshhold: float
     """
     Marabou options: 'timeoutInSeconds' is the timeout parameter. 
     """
     options = Marabou.createOptions(numWorkers=16,
                                     timeoutInSeconds=300,
                                     verbosity=0,
-                                    solveWithMILP=True)
+                                    solveWithMILP=False)
 
     def __init__(self,
                  name,
                  dataset,
                  image,
                  model_path,
-                 plot_original=True):
+                 plot_original=True, 
+                 # ONNX requires input of float32
+                 threshhold=1e-4):
         """
         To initialize the VeriX class.
         :param dataset: 'MNIST' or 'GTSRB'.
@@ -53,6 +56,7 @@ class VeriX:
         self.dataset = dataset
         self.image = image
         self.name = name
+        self.threshhold = threshhold
         """
         Load the onnx model.
         """
@@ -206,7 +210,7 @@ class VeriX:
                     """
                     if j != self.label:
                         self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
-                                                    [1, -1], -1e-6,
+                                                    [1, -1], -self.threshhold,
                                                     isProperty=True)
                         exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
                         """
@@ -233,30 +237,33 @@ class VeriX:
                 elif exit_code == 'sat':
                     sat_set.append(pixel)
                     counterfactuals[pixel] = [vals.get(i) for i in self.mara_model.inputVars[0].flatten()]
-                    counterfactuals[pixel] = np.asarray(counterfactuals[pixel]).reshape(self.image.shape)
-
-                    # get max difference between counterfactual and original
-                    max_diff = np.max(np.abs(image.flatten() - counterfactuals[pixel].flatten()))
-                    print(f"{self.name} max_diff: ", max_diff)
+                    counterfactuals[pixel] = np.asarray(counterfactuals[pixel]).reshape(self.image.shape).astype(np.float32)
 
                     prediction = [vals.get(i) for i in self.outputVars]
+                    if pixel == 440:
+                        np.set_printoptions(precision=10)
+                        print("440 prediction")
+                        print(prediction)
+
                     prediction = np.asarray(prediction).argmax()
+
+                    assert prediction != self.label
                     if plot_counterfactual:
                         self.save_figure(image=counterfactuals[pixel],
                                     path="counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
                                     cmap="gray" if self.dataset == 'MNIST' else None)
-            with open(cache_file, 'wb') as f:
-                pickle.dump({
-                    'image': image,
-                    'epsilon': epsilon,
-                    'sat_set': sat_set,
-                    'unsat_set': unsat_set,
-                    'counterfactuals': counterfactuals
-                }, f)
+            if cache_file is not None:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump({
+                        'image': image,
+                        'epsilon': epsilon,
+                        'sat_set': sat_set,
+                        'unsat_set': unsat_set,
+                        'counterfactuals': counterfactuals
+                    }, f)
 
         assert self.fast_test_explanation(image, epsilon, sat_set, unsat_set, counterfactuals)
-        # print("passed test")
-        print("226")
+        print("passed test")
         if plot_explanation:
             mask = np.zeros(self.inputVars.shape).astype(bool)
             mask[sat_set] = True
@@ -314,7 +321,7 @@ class VeriX:
         for j in range(len(self.outputVars)):
             if j != self.label:
                 self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
-                                                [1, -1], -1e-6,
+                                                [1, -1], -self.threshhold,
                                                 isProperty=True)
                 exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
                 self.mara_model.additionalEquList.clear()
@@ -327,17 +334,18 @@ class VeriX:
         if exit_code == 'sat':
             return False
         
+        image_flat = image.flatten()
         for i in sat_set:
-            counterfactual = counterfactuals[i]
-            if np.linalg.norm(image.flatten() - counterfactual.flatten(), np.inf) > epsilon:
-                print("330: ", np.linalg.norm(image.flatten() - counterfactual.flatten(), np.inf))
+            counterfactual_flat = counterfactuals[i].flatten()
+            if np.linalg.norm(image_flat - counterfactual_flat, np.inf) > epsilon + self.threshhold:
+                print("330: ", np.linalg.norm(image_flat - counterfactual_flat, np.inf), epsilon + self.threshhold)
                 return False
 
             # make sure that different pixels from the original are entirely in the unsat set
             # except for one in the sat_set
             cnt_in_sat_set = 0
             for j in self.inputVars:
-                if image[j] != counterfactual[j]:
+                if image_flat[j] != counterfactual_flat[j]:
                     if j in sat_set:
                         cnt_in_sat_set += 1
                     elif j in unsat_set:
@@ -349,9 +357,13 @@ class VeriX:
                 print("346")
                 return False
             # check if the counterfactual is valid by running the model
-            counterfactual_result = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: np.expand_dims(counterfactual, axis=0)})
+            counterfactual_result = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: np.expand_dims(counterfactuals[i], axis=0)})
             counterfactual_result = np.asarray(counterfactual_result[0])
             if counterfactual_result.argmax() == self.label:
+                print("sat pixel: ", i)
+                np.set_printoptions(precision=10)
+                print("counterfactual_result: ", counterfactual_result)
+                print("self.label: ", self.label)
                 print("352")
                 return False
         return True

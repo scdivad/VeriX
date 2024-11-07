@@ -234,10 +234,16 @@ class VeriX:
             elif exit_code == 'sat':
                 sat_set.add(pixel)
                 if True or plot_counterfactual:
+                    # TODO: I think c_G should store all 3 examples
+                    # so gtsrb is same as VeriX except the comparison
+
+                    # counterfactual has 3 channels
                     counterfactual = [vals.get(i) for i in self.mara_model.inputVars[0].flatten()]
                     counterfactual = np.asarray(counterfactual).reshape(self.image.shape)
                     counterfactuals.append(counterfactual)
 
+                    # changed_mask has one channel
+                    # maybe better style is boolean mask ...
                     changed_mask = (np.abs(counterfactual.reshape(image.shape) - self.image.reshape(image.shape)) > 1e-6).any(axis=-1)
                     c_G[pixel] = np.where(changed_mask)[0]
                     curr_counterfactual = tuple(c_G[pixel])
@@ -272,18 +278,20 @@ class VeriX:
                                     path="axed_counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
                                     cmap="gray" if self.dataset == 'MNIST' else None)
 
+                        # TODO: this is a problem, we are removing incorrectly
                         # Remove elements in A that relied on counterfactual
-                        for p in same_counterfactual[combined_counterfactual]:
-                            sat_set.remove(p)
-                            dq.append(p)
+                        for pA in same_counterfactual[combined_counterfactual]:
+                            if pA in sat_set:
+                                sat_set.remove(pA)
+                            dq.append(pA)
                         same_counterfactual[combined_counterfactual] = []
 
-                        for p in c_G[pixel]:
+                        for pB_1_channel in c_G[pixel]:
                             if p == pixel: continue
                             unsat_set.remove(p)
 
                             # Remove elements from A that relied on that particular element in B
-                            depends_on_p = {p2 for p2 in sat_set if p in c_G[p2]}
+                            depends_on_p = {p2 for p2 in sat_set if 3*p in c_G[p2] or 3*p+1 in c_G[p2] or 3*p+2 in c_G[p2]}
                             for p2 in depends_on_p:
                                 dq.appendleft(p2)
                             sat_set = sat_set - depends_on_p

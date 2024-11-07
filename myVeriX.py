@@ -8,7 +8,29 @@ from matplotlib import pyplot as plt
 from maraboupy import Marabou
 import collections
 import os
-
+'''
+passed tests
+7270 425.6060001850128 165
+passed tests
+860 261.6677267551422 35
+passed tests
+5390 242.66076517105103 0
+passed tests
+5191 366.99401926994324 312
+passed tests
+5734 255.41195702552795 425
+passed tests
+6265 1750.8210852146149 186
+passed tests
+466 223.21297764778137 231
+passed tests
+4426 239.11786484718323 358
+passed tests
+5578 288.80060839653015 275
+passed tests
+8322 188.79589676856995 508
+all:  2495 0
+'''
 class VeriX:
     """
     This is the VeriX class to take in an image and a neural network, and then output an explanation.
@@ -36,7 +58,9 @@ class VeriX:
                  dataset,
                  image,
                  model_path,
-                 plot_original=True):
+                 plot_original=True, 
+                 # ONNX requires input of float32
+                 threshold=1e-4):
         """
         To initialize the VeriX class.
         :param dataset: 'MNIST' or 'GTSRB'.
@@ -47,6 +71,7 @@ class VeriX:
         self.dataset = dataset
         self.image = image
         self.name = name
+        self.threshold = threshold
         """
         Load the onnx model.
         """
@@ -164,6 +189,7 @@ class VeriX:
 
         dq = collections.deque(self.inputVars)
 
+        counterfactuals = {}
         cnt_iter = 0
         while len(dq) > 0:
             pixel = dq.popleft()
@@ -231,10 +257,10 @@ class VeriX:
             elif exit_code == 'sat':
                 sat_set.add(pixel)
                 if True or plot_counterfactual:
-                    counterfactual = [vals.get(i) for i in self.mara_model.inputVars[0].flatten()]
-                    counterfactual = np.asarray(counterfactual).reshape(self.image.shape)
+                    counterfactuals[pixel] = [vals.get(i) for i in self.mara_model.inputVars[0].flatten()]
+                    counterfactuals[pixel] = np.asarray(counterfactuals[pixel]).reshape(self.image.shape).astype(np.float32)
 
-                    changed_mask = np.abs(counterfactual.reshape(image.shape) - self.image.reshape(image.shape)) > 1e-6
+                    changed_mask = np.abs(counterfactuals[pixel].reshape(image.shape) - self.image.reshape(image.shape)) > 1e-6
                     c_G[pixel] = np.where(changed_mask)[0]
                     counterfactual_key = tuple(c_G[pixel])
                     same_counterfactual[counterfactual_key] = same_counterfactual.get(counterfactual_key, []) + [pixel]
@@ -248,6 +274,7 @@ class VeriX:
                         # Remove elements in A that relied on counterfactual
                         for p in same_counterfactual[counterfactual_key]:
                             sat_set.remove(p)
+                            counterfactuals.pop(p)
                             dq.append(p)
                         same_counterfactual[counterfactual_key] = []
 
@@ -294,18 +321,18 @@ class VeriX:
                                         bg_label=0,
                                         saturation=1),
                         path="timeout-%d.png" % len(timeout_set))
-        # assert self.fast_test_explanation(image, epsilon, sat_set, unsat_set)
-        # print("passed tests")
+        assert self.fast_test_explanation(image, epsilon, sat_set, unsat_set, counterfactuals)
+        print("passed tests")
         return len(sat_set), len(timeout_set)
     
 
-    def fast_test_explanation(self, image, epsilon, sat_set, unsat_set, counterfactual):
+    def fast_test_explanation(self, image, epsilon, sat_set, unsat_set, counterfactuals):
         # check if there is a counterfactual with only the unsat pixels
         for i in self.inputVars:
             if i in unsat_set:
                 if self.dataset == "MNIST":
-                        self.mara_model.setLowerBound(i, max(0, image[i][:] - epsilon))
-                        self.mara_model.setUpperBound(i, min(1, image[i][:] + epsilon))
+                    self.mara_model.setLowerBound(i, max(0, image[i][:] - epsilon))
+                    self.mara_model.setUpperBound(i, min(1, image[i][:] + epsilon))
                 elif self.dataset == "GTSRB":
                     self.mara_model.setLowerBound(3 * i, max(0, image[i][0] - epsilon))
                     self.mara_model.setUpperBound(3 * i, min(1, image[i][0] + epsilon))
@@ -315,7 +342,7 @@ class VeriX:
                     self.mara_model.setUpperBound(3 * i + 2, min(1, image[i][2] + epsilon))
                 else:
                     print("Dataset not supported: try 'MNIST' or 'GTSRB'.")
-            else:
+            elif i in sat_set:
                 if self.dataset == "MNIST":
                     self.mara_model.setLowerBound(i, image[i][:])
                     self.mara_model.setUpperBound(i, image[i][:])
@@ -328,43 +355,59 @@ class VeriX:
                     self.mara_model.setUpperBound(3 * i + 2, image[i][2])
                 else:
                     print("Dataset not supported: try 'MNIST' or 'GTSRB'.")
-            for j in range(len(self.outputVars)):
-                if j != self.label:
-                    self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
-                                                  [1, -1], -1e-6,
-                                                  isProperty=True)
-                    exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
-                    self.mara_model.additionalEquList.clear() 
-                    if exit_code == 'sat' or exit_code == 'TIMEOUT':
-                        break
-                    elif exit_code == 'unsat':
-                        continue
-            self.mara_model.clearProperty()
-            assert exit_code != 'TIMEOUT'
-            if exit_code == 'sat':
+            else:
                 return False
-        # make sure that the norm difference from the original image is less than epsilon
-        if np.linalg.norm(image.flatten() - counterfactual.flatten(), np.inf) > epsilon:
+        for j in range(len(self.outputVars)):
+            if j != self.label:
+                self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
+                                                [1, -1], -self.threshold,
+                                                isProperty=True)
+                exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
+                self.mara_model.additionalEquList.clear()
+                if exit_code == 'sat' or exit_code == 'TIMEOUT':
+                    break
+                elif exit_code == 'unsat':
+                    continue
+        self.mara_model.clearProperty()
+        assert exit_code != 'TIMEOUT'
+        if exit_code == 'sat':
             return False
-        # make sure that different pixels from the original are entirely in the unsat set
-        # except for one in the sat_set
-        cnt_in_sat_set = 0
-        cnt_in_unsat_set = 0
-        for i in self.inputVars:
-            if image[i] != counterfactual[i]:
-                if i in unsat_set:
-                    cnt_in_unsat_set += 1
-                elif i in sat_set:
-                    cnt_in_sat_set += 1
-                else:
-                    return False
-        if cnt_in_sat_set > 1:
-            return False
-        # check if the counterfactual is a valid counterfactual by running the model
-        counterfactual_result = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: np.expand_dims(counterfactual, axis=0)})
-        counterfactual_result = np.asarray(counterfactual_result[0])
-        if counterfactual_result.argmax() == self.label:
-            return False
+        
+        image_flat = image.flatten()
+        for i in sat_set:
+            counterfactual_flat = counterfactuals[i].flatten()
+            if np.linalg.norm(image_flat - counterfactual_flat, np.inf) > epsilon + self.threshold:
+                print("330: ", np.linalg.norm(image_flat - counterfactual_flat, np.inf), epsilon + self.threshold)
+                return False
+
+            # make sure that different pixels from the original are entirely in the unsat set
+            # except for one in the sat_set
+            cnt_in_sat_set = 0
+            for j in self.inputVars:
+                if image_flat[j] != counterfactual_flat[j]:
+                    if j in sat_set:
+                        cnt_in_sat_set += 1
+                    elif j in unsat_set:
+                        pass
+                    else:
+                        print("343")
+                        return False
+            if cnt_in_sat_set > 1:
+                print("346")
+                return False
+            # check if the counterfactual is valid by running the model
+            counterfactual_result = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: np.expand_dims(counterfactuals[i], axis=0)})
+            counterfactual_result = np.asarray(counterfactual_result[0])
+            if counterfactual_result.argmax() == self.label:
+                # print("sat pixel: ", i)
+                np.set_printoptions(precision=10)
+                # print("counterfactual_result: ", counterfactual_result)
+                # print("self.label: ", self.label)
+                # print("352")
+                with open("warning.txt", "w+") as f:
+                    f.write(f'{counterfactual_result[0].tolist()} {self.label}')
+                    f.flush()
+                
         return True
     
     def save_figure(self, image, path, cmap=None):
