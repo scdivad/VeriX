@@ -8,29 +8,10 @@ from matplotlib import pyplot as plt
 from maraboupy import Marabou
 import collections
 import os
-'''
-passed tests
-7270 425.6060001850128 165
-passed tests
-860 261.6677267551422 35
-passed tests
-5390 242.66076517105103 0
-passed tests
-5191 366.99401926994324 312
-passed tests
-5734 255.41195702552795 425
-passed tests
-6265 1750.8210852146149 186
-passed tests
-466 223.21297764778137 231
-passed tests
-4426 239.11786484718323 358
-passed tests
-5578 288.80060839653015 275
-passed tests
-8322 188.79589676856995 508
-all:  2495 0
-'''
+import pickle
+import sys
+sys.path.insert(0, "Marabou")
+
 class VeriX:
     """
     This is the VeriX class to take in an image and a neural network, and then output an explanation.
@@ -51,7 +32,7 @@ class VeriX:
     options = Marabou.createOptions(numWorkers=16,
                                     timeoutInSeconds=300,
                                     verbosity=0,
-                                    solveWithMILP=False)
+                                    solveWithMILP=True)
 
     def __init__(self,
                  name,
@@ -60,7 +41,7 @@ class VeriX:
                  model_path,
                  plot_original=True, 
                  # ONNX requires input of float32
-                 threshold=1e-4):
+                 threshold=1e-6):
         """
         To initialize the VeriX class.
         :param dataset: 'MNIST' or 'GTSRB'.
@@ -136,10 +117,10 @@ class VeriX:
             predictions_manip = self.onnx_session.run(None, {self.onnx_model.graph.input[0].name: image_batch_manip})
             predictions_manip = np.asarray(predictions_manip[0])
 
-            # difference = predictions - predictions_manip
-            # features = difference[:, self.label]
-            kl_difference = np.sum(predictions * np.log(np.maximum(predictions, 1e-9) / (np.maximum(predictions_manip, 1e-9))), axis=-1)
-            features = kl_difference
+            difference = predictions - predictions_manip
+            features = difference[:, self.label]
+            # kl_difference = np.sum(predictions * np.log(np.maximum(predictions, 1e-9) / (np.maximum(predictions_manip, 1e-9))), axis=-1)
+            # features = kl_difference
 
             sorted_index = features.argsort() # TOOD: understand why this happens lmfao [::-1]
 
@@ -158,6 +139,11 @@ class VeriX:
                         plot_explanation=True,
                         plot_counterfactual=False,
                         plot_timeout=False):
+        def similar(a, b, bool=True):
+            score = (torch.tensor(a) == torch.tensor(b)).sum() / 784
+            if bool: 
+                return score > 0.95
+            return score
         """
         To compute the explanation for the model and the neural network.
         :param epsilon: the perturbation magnitude.
@@ -171,7 +157,7 @@ class VeriX:
         u -> v iff u in A and v in {u}+B and v was in u's counterfactual
         note that it is impossible for there to be paths of length > 1
         '''
-        c_G = [[] for _ in range(len(self.inputVars))]
+        c_mask = [[] for _ in range(len(self.inputVars))]
 
         '''
         same_counterfactual has key of a counterfactual changed pixels in B  
@@ -188,7 +174,8 @@ class VeriX:
         tmp = self.inputVars.copy()
 
         dq = collections.deque(self.inputVars)
-
+        triggered_idx = 0
+        trigger_dict = {}
         counterfactuals = {}
         cnt_iter = 0
         while len(dq) > 0:
@@ -236,7 +223,7 @@ class VeriX:
                 """
                 if j != self.label:
                     self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
-                                                  [1, -1], -1e-6,
+                                                  [1, -1], -self.threshold*10,
                                                   isProperty=True)
                     exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
                     """
@@ -256,45 +243,66 @@ class VeriX:
                 timeout_set.add(pixel)
             elif exit_code == 'sat':
                 sat_set.add(pixel)
-                if True or plot_counterfactual:
+                if plot_counterfactual:
                     counterfactuals[pixel] = [vals.get(i) for i in self.mara_model.inputVars[0].flatten()]
                     counterfactuals[pixel] = np.asarray(counterfactuals[pixel]).reshape(self.image.shape).astype(np.float32)
 
-                    changed_mask = np.abs(counterfactuals[pixel].reshape(image.shape) - self.image.reshape(image.shape)) > 1e-6
-                    c_G[pixel] = np.where(changed_mask)[0]
-                    counterfactual_key = tuple(c_G[pixel])
-                    same_counterfactual[counterfactual_key] = same_counterfactual.get(counterfactual_key, []) + [pixel]
-                    if (len(same_counterfactual[counterfactual_key]) > 10 and changed_mask.sum() >= 5) or (len(same_counterfactual[counterfactual_key]) > 50 and changed_mask.sum() >= 1):
-                        prediction = [vals.get(i) for i in self.outputVars]
-                        prediction = np.asarray(prediction).argmax()
-                        self.save_figure(image=counterfactual,
-                                    path="axed_counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
-                                    cmap="gray" if self.dataset == 'MNIST' else None)
-
-                        # Remove elements in A that relied on counterfactual
-                        for p in same_counterfactual[counterfactual_key]:
-                            sat_set.remove(p)
-                            counterfactuals.pop(p)
-                            dq.append(p)
-                        same_counterfactual[counterfactual_key] = []
-
-                        # TODO: continue if p is the pixel
-                        for p in c_G[pixel]:
-                            # Remove elements in B of the counterfactual
-                            unsat_set.remove(p)
-
-                            # Remove elements from A that relied on that particular element in B
-                            depends_on_p = {p2 for p2 in sat_set if p in c_G[p2]}
-                            for p2 in depends_on_p:
-                                dq.appendleft(p2)
-                            sat_set = sat_set - depends_on_p
-                        continue
-
+                    # for our purposes, we only consider sat/unsat pixels and compare counterfactuals on the height/width space
+                    # because that's more human interpretable and is what the original VeriX code does
+                    c_mask[pixel] = (counterfactuals[pixel] != self.image).any(axis=-1).flatten()
+                    # print("c_mask[pixel] shape shoud just be (width * height, )", c_mask[pixel].shape, width*height)
+                        
                     prediction = [vals.get(i) for i in self.outputVars]
                     prediction = np.asarray(prediction).argmax()
-                    # self.save_figure(image=counterfactual,
-                    #             path="counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
-                    #             cmap="gray" if self.dataset == 'MNIST' else None)
+
+                    c_mask_key = tuple(c_mask[pixel])
+                    ref_key = None
+                    for other_c_mask_key in same_counterfactual:
+                        if similar(c_mask_key, other_c_mask_key):
+                            same_counterfactual[other_c_mask_key] = same_counterfactual.get(other_c_mask_key, []) + [pixel]
+                            ref_key = other_c_mask_key
+                            break
+                    if ref_key is None:
+                        same_counterfactual[c_mask_key] = same_counterfactual.get(c_mask_key, []) + [pixel]
+                            
+                    # if ref_key is None:
+                    #     same_counterfactual[c_mask_key] = [pixel]
+                    #     with open("max_sim.txt", "a+") as f:
+                    #         print("pixel: ", pixel, max_sim)
+
+                    if ref_key is not None:
+                        with open("lens.txt", "a+") as f: f.write(f'{len(same_counterfactual[ref_key])}\n')
+                        if (len(same_counterfactual[ref_key]) > 50 and c_mask[pixel].sum() >= 5) or \
+                            (len(same_counterfactual[ref_key]) > 100 and c_mask[pixel].sum() >= 1):
+                            
+
+                            with open("triggered.txt", "a+") as f: 
+                                f.write(f'{sorted(same_counterfactual[ref_key])}')
+                                f.write("triggered\n"); print("triggered")
+                                triggered_idx += 1
+                                for tP in same_counterfactual[ref_key]:
+                                    self.save_figure(counterfactuals[tP], f"trigger/{triggered_idx}")
+
+                            iBs, = c_mask[pixel].nonzero()
+                            iBs = set(iBs.tolist())
+                            iBs.remove(pixel)
+
+                            # Add iBs back for re-evaluation
+                            unsat_set = unsat_set - iBs
+                            dq.extend(iBs)
+                            
+                            # Remove elements from A that relied on that particular element in B
+                            for iB in iBs:
+                                depends_on_iB = {iA for iA in sat_set if c_mask[iA][iB]}
+                                sat_set = sat_set - depends_on_iB
+                                dq.extendleft(depends_on_iB)
+
+                            same_counterfactual[ref_key] = []
+                            continue
+
+                    self.save_figure(image=counterfactuals[pixel],
+                                path="counterfactual-at-pixel-%d-predicted-as-%d.png" % (pixel, prediction),
+                                cmap="gray" if self.dataset == 'MNIST' else None)
                     
         self.inputVars = tmp
         sat_set = list(sat_set)
@@ -356,11 +364,12 @@ class VeriX:
                 else:
                     print("Dataset not supported: try 'MNIST' or 'GTSRB'.")
             else:
+                print("367", i)
                 return False
         for j in range(len(self.outputVars)):
             if j != self.label:
                 self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
-                                                [1, -1], -self.threshold,
+                                                [1, -1], 10 * -self.threshold,
                                                 isProperty=True)
                 exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
                 self.mara_model.additionalEquList.clear()
@@ -371,6 +380,7 @@ class VeriX:
         self.mara_model.clearProperty()
         assert exit_code != 'TIMEOUT'
         if exit_code == 'sat':
+            print("no way")
             return False
         
         image_flat = image.flatten()
@@ -404,7 +414,7 @@ class VeriX:
                 # print("counterfactual_result: ", counterfactual_result)
                 # print("self.label: ", self.label)
                 # print("352")
-                with open("warning.txt", "w+") as f:
+                with open("warning.txt", "w") as f:
                     f.write(f'{counterfactual_result[0].tolist()} {self.label}')
                     f.flush()
                 
@@ -418,7 +428,7 @@ class VeriX:
         :param cmap: 'gray' if to plot gray scale image.
         :return: an image saved to the designated path.
         """
-        folder = f"my_midpoint/{self.name}/"
+        folder = f"my_final/{self.name}/"
         if not os.path.exists(folder):
             os.makedirs(folder)
         path = folder + path

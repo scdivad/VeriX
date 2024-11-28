@@ -5,7 +5,7 @@ from keras.datasets import mnist
 from keras.losses import CategoricalCrossentropy
 from keras.optimizers import Adam
 import tf2onnx
-from myVeriX import *
+from origVerix import *
 import time
 import sys
 
@@ -25,6 +25,7 @@ show a simple example usage of VeriX.
 """
 np.random.seed(42)
 indices = np.random.choice(x_test.shape[0], 1000)[:10]
+indices = np.array([16])
 print(indices)
 
 tot_sat_len = 0

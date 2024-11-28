@@ -210,7 +210,7 @@ class VeriX:
                     """
                     if j != self.label:
                         self.mara_model.addInequality([self.outputVars[self.label], self.outputVars[j]],
-                                                    [1, -1], -self.threshhold,
+                                                    [1, -1], 10*-self.threshhold,
                                                     isProperty=True)
                         exit_code, vals, stats = self.mara_model.solve(options=self.options, verbose=False)
                         """

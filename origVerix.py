@@ -38,7 +38,7 @@ class VeriX:
                  dataset,
                  image,
                  model_path,
-                 plot_original=True):
+                 plot_original=True, name=""):
         """
         To initialize the VeriX class.
         :param dataset: 'MNIST' or 'GTSRB'.

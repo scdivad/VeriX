@@ -33,8 +33,8 @@ gtsrb_labels = ['50 mph', '30 mph', 'yield', 'priority road',
 show a simple example usage of VeriX. 
 """
 np.random.seed(42)
-indices = np.random.choice(x_test.shape[0], 1000)
-# print(indices)
+indices = np.random.choice(x_test.shape[0], 1000)[:10]
+print(indices)
 
 tot_sat_len = 0
 tot_timeout_len = 0
@@ -52,8 +52,7 @@ for idx in indices:
     tot_timeout_len += len_timeout_set
     print(f"{idx} {time_end - time_start} {len_sat_set}", file=sys.stdout, flush=True)
     i += 1
-    if i == 100: 
-        os.system( "say success" )
+    if i == 100:
         exit()
 
 
